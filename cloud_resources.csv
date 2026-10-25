@@ -1,0 +1,11 @@
+resource_id,resource_type,cpu_usage,memory_usage,monthly_cost
+VM-01,Virtual Machine,75,68,8000
+VM-02,Virtual Machine,4,12,6000
+VM-03,Virtual Machine,15,20,5000
+VM-04,Virtual Machine,85,80,9000
+VM-05,Virtual Machine,3,8,7000
+DB-01,Database,70,75,10000
+DB-02,Database,8,10,8000
+ST-01,Storage,20,15,3000
+ST-02,Storage,5,8,4000
+VM-06,Virtual Machine,10,15,6000
