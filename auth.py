@@ -1,31 +1,21 @@
+import hashlib
+import hmac
+import secrets
+import sqlite3
+from pathlib import Path
 
 import streamlit as st
-import sqlite3
-import hashlib
-import secrets
-import os
 
-DB_FOLDER = "project databases"
-DB_PATH = os.path.join(DB_FOLDER, "users.db")
+# Local development database. Use persistent managed storage before public deployment.
+BASE_DIR = Path(__file__).resolve().parent
+DB_DIR = BASE_DIR / "project databases"
+DB_PATH = DB_DIR / "users.db"
+PBKDF2_ITERATIONS = 300_000
 
 
 def get_connection():
-    os.makedirs(DB_FOLDER, exist_ok=True)
-    return sqlite3.connect(DB_PATH)
-
-
-def hash_password(password, salt=None):
-    if salt is None:
-        salt = secrets.token_hex(16)
-
-    password_hash = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        bytes.fromhex(salt),
-        300000,
-    ).hex()
-
-    return salt, password_hash
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    return sqlite3.connect(DB_PATH, timeout=10)
 
 
 def initialize_database():
@@ -34,207 +24,106 @@ def initialize_database():
             CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY COLLATE NOCASE,
                 salt TEXT NOT NULL,
-                password_hash TEXT NOT NULL
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
-        columns = {
-            row[1]
-            for row in conn.execute("PRAGMA table_info(users)")
-        }
 
-        if "role" not in columns:
-            conn.execute(
-                "ALTER TABLE users "
-                "ADD COLUMN role TEXT NOT NULL DEFAULT 'Resource Owner'"
-            )
+def hash_password(password, salt_hex=None):
+    if salt_hex is None:
+        salt_hex = secrets.token_hex(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt_hex), PBKDF2_ITERATIONS
+    ).hex()
+    return salt_hex, password_hash
 
 
-def register_user(username, password, role="Resource Owner"):
+def register_user(username, password):
     username = username.strip()
-
-    if len(username) < 3:
-        return False, "Username must contain at least 3 characters."
-
-    if len(username) > 50:
-        return False, "Username must not exceed 50 characters."
-
+    if not 3 <= len(username) <= 50:
+        return False, "Username must be between 3 and 50 characters."
+    if any(ch.isspace() for ch in username):
+        return False, "Username cannot contain spaces."
     if len(password) < 12:
-        return False, "Use a password with at least 12 characters."
-
-    if role not in ("Admin", "Resource Owner", "Manager"):
-        return False, "Invalid role."
+        return False, "Password must contain at least 12 characters."
 
     salt, password_hash = hash_password(password)
-
     try:
         with get_connection() as conn:
             conn.execute(
-                """INSERT INTO users
-                   (username, salt, password_hash, role)
-                   VALUES (?, ?, ?, ?)""",
-                (username, salt, password_hash, role),
+                "INSERT INTO users (username, salt, password_hash) VALUES (?, ?, ?)",
+                (username, salt, password_hash),
             )
-
         return True, "Account created. You can now log in."
-
     except sqlite3.IntegrityError:
         return False, "That username already exists."
-    
+
+
 def verify_user(username, password):
+    username = username.strip()
     with get_connection() as conn:
         row = conn.execute(
-            """SELECT username, salt, password_hash, role
-               FROM users
-               WHERE username = ?""",
-            (username.strip(),),
+            "SELECT username, salt, password_hash FROM users WHERE username = ?",
+            (username,),
         ).fetchone()
-
     if row is None:
-        return None
-
-    saved_username, salt, saved_hash, role = row
-
+        # Reduce obvious timing differences for unknown usernames.
+        hash_password(password, "0" * 32)
+        return False, None
+    saved_username, salt, saved_hash = row
     _, entered_hash = hash_password(password, salt)
+    return hmac.compare_digest(saved_hash, entered_hash), saved_username
 
-    if not secrets.compare_digest(saved_hash, entered_hash):
-        return None
-
-    return {
-        "username": saved_username,
-        "role": role,
-    }
 
 def show_login():
     initialize_database()
 
-    if st.session_state.get("logged_in", False):
-        st.sidebar.success(
-            f"Logged in as {st.session_state['username']}"
-        )
-        st.sidebar.info(
-    f"Role: {st.session_state.get('role', 'Resource Owner')}"
-)
-
-        if st.sidebar.button("Log out"):
+    if st.session_state.get("logged_in") is True:
+        st.sidebar.success(f"Signed in as {st.session_state.get('username', 'User')}")
+        if st.sidebar.button("Log out", key="auth_logout"):
             st.session_state.pop("logged_in", None)
             st.session_state.pop("username", None)
-            st.session_state.pop("role", None)
             st.rerun()
-
         return True
 
-    st.title("Cloud FinOps Optimizer")
-    st.subheader("Login or create your account")
+    st.title("☁️ Cloud FinOps Optimizer")
+    st.subheader("Sign in or create an account")
+    login_tab, signup_tab = st.tabs(["Login", "Create Account"])
 
-    choice = st.radio(
-        "Choose an option",
-        ["Login", "Create Account"],
-        horizontal=True,
-    )
-
-    if choice == "Create Account":
-        with st.form("signup_form"):
-            username = st.text_input("Choose a username")
-            password = st.text_input(
-                "Create a password",
-                type="password",
-            )
-            confirm = st.text_input(
-                "Confirm password",
-                type="password",
-            )
-            submitted = st.form_submit_button("Create Account")
-
-        if submitted:
-            if password != confirm:
-                st.error("The passwords do not match.")
-            else:
-                success, message = register_user(username, password)
-                if success:
-                    st.success(message)
-                    st.info("Select Login above to sign in.")
-                else:
-                    st.error(message)
-
-    else:
+    with login_tab:
         with st.form("login_form"):
-            username = st.text_input("Username")
-            password = st.text_input(
-                "Password",
-                type="password",
-            )
-            submitted = st.form_submit_button("Login")
-
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input("Password", type="password", key="login_password")
+            submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
         if submitted:
-            user = verify_user(username, password)
-
-            if user:
+            valid, saved_username = verify_user(username, password)
+            if valid:
                 st.session_state["logged_in"] = True
-                st.session_state["username"] = user["username"]
-                st.session_state["role"] = user["role"]
+                st.session_state["username"] = saved_username
                 st.rerun()
             else:
                 st.error("Invalid username or password.")
 
-def get_all_users():
-    with get_connection() as conn:
-        rows = conn.execute(
-            "SELECT username, role FROM users ORDER BY username"
-        ).fetchall()
+    with signup_tab:
+        st.caption("Choose a username and a password of at least 12 characters.")
+        with st.form("signup_form"):
+            new_username = st.text_input("Choose a username", key="signup_username")
+            new_password = st.text_input("Create password", type="password", key="signup_password")
+            confirm_password = st.text_input("Confirm password", type="password", key="signup_confirm")
+            signup_submitted = st.form_submit_button("Create Account", use_container_width=True)
+        if signup_submitted:
+            if new_password != confirm_password:
+                st.error("The passwords do not match.")
+            else:
+                success, message = register_user(new_username, new_password)
+                if success:
+                    # Sign the new user in immediately and let the main app continue
+                    # to the dashboard on the next Streamlit rerun.
+                    st.session_state["logged_in"] = True
+                    st.session_state["username"] = new_username.strip()
+                    st.rerun()
+                else:
+                    st.error(message)
 
-    return [
-        {"Username": row[0], "Role": row[1]}
-        for row in rows
-    ]
-def update_user_role(username, new_role):
-    allowed_roles = ("Admin", "Manager", "Resource Owner")
-
-    if new_role not in allowed_roles:
-        return False, "Invalid role."
-
-    with get_connection() as conn:
-        current = conn.execute(
-            "SELECT role FROM users WHERE username = ?",
-            (username.strip(),),
-        ).fetchone()
-
-        if current is None:
-            return False, "User not found."
-
-        if current[0] == "Admin" and new_role != "Admin":
-            admin_count = conn.execute(
-                "SELECT COUNT(*) FROM users WHERE role = 'Admin'"
-            ).fetchone()[0]
-
-            if admin_count <= 1:
-                return False, "Cannot remove the last Admin."
-
-        conn.execute(
-            "UPDATE users SET role = ? WHERE username = ?",
-            (new_role, username.strip()),
-        )
-
-    return True, "Role updated successfully."
-    allowed_roles = ("Admin", "Manager", "Resource Owner")
-
-    if new_role not in allowed_roles:
-        return False
-
-    with get_connection() as conn:
-        cursor = conn.execute(
-            "UPDATE users SET role = ? WHERE username = ?",
-            (new_role, username.strip()),
-        )
-def fix_abhiram_role():
-    with get_connection() as conn:
-        conn.execute(
-            "UPDATE users SET role = ? WHERE username = ?",
-            ("Admin", "Abhiram"),
-        )
-        row = conn.execute(
-            "SELECT username, role FROM users WHERE username = ?",
-            ("Abhiram",),
-        ).fetchone()
-    print(row)
-    
+    return False
