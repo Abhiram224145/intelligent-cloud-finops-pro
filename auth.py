@@ -6,11 +6,12 @@ from pathlib import Path
 
 import streamlit as st
 
-# Local development database. Use persistent managed storage before public deployment.
+# SQLite database used by the current prototype.
 BASE_DIR = Path(__file__).resolve().parent
 DB_DIR = BASE_DIR / "project databases"
 DB_PATH = DB_DIR / "users.db"
 PBKDF2_ITERATIONS = 300_000
+VALID_ROLES = ("Resource Owner", "Manager", "Admin")
 
 
 def get_connection():
@@ -20,14 +21,21 @@ def get_connection():
 
 def initialize_database():
     with get_connection() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS users (
                 username TEXT PRIMARY KEY COLLATE NOCASE,
                 salt TEXT NOT NULL,
                 password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                role TEXT NOT NULL DEFAULT 'Resource Owner'
+            )"""
+        )
+        # Upgrade databases created by the older version of this app.
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
+        if "role" not in columns:
+            conn.execute(
+                "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'Resource Owner'"
             )
-        """)
 
 
 def hash_password(password, salt_hex=None):
@@ -52,10 +60,10 @@ def register_user(username, password):
     try:
         with get_connection() as conn:
             conn.execute(
-                "INSERT INTO users (username, salt, password_hash) VALUES (?, ?, ?)",
-                (username, salt, password_hash),
+                "INSERT INTO users (username, salt, password_hash, role) VALUES (?, ?, ?, ?)",
+                (username, salt, password_hash, "Resource Owner"),
             )
-        return True, "Account created. You can now log in."
+        return True, "Account created successfully."
     except sqlite3.IntegrityError:
         return False, "That username already exists."
 
@@ -64,16 +72,47 @@ def verify_user(username, password):
     username = username.strip()
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT username, salt, password_hash FROM users WHERE username = ?",
+            "SELECT username, salt, password_hash, role FROM users WHERE username = ?",
             (username,),
         ).fetchone()
     if row is None:
-        # Reduce obvious timing differences for unknown usernames.
         hash_password(password, "0" * 32)
-        return False, None
-    saved_username, salt, saved_hash = row
+        return False, None, None
+    saved_username, salt, saved_hash, role = row
     _, entered_hash = hash_password(password, salt)
-    return hmac.compare_digest(saved_hash, entered_hash), saved_username
+    return hmac.compare_digest(saved_hash, entered_hash), saved_username, role
+
+
+def get_all_users():
+    """Return user records in the column format expected by the admin dashboard."""
+    initialize_database()
+    with get_connection() as conn:
+        rows = conn.execute(
+            "SELECT username, role, created_at FROM users ORDER BY username COLLATE NOCASE"
+        ).fetchall()
+    return [
+        {"Username": username, "Role": role, "Created At": created_at}
+        for username, role, created_at in rows
+    ]
+
+
+def update_user_role(username, new_role):
+    if new_role not in VALID_ROLES:
+        return False, "Invalid role selected."
+    initialize_database()
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "UPDATE users SET role = ? WHERE username = ?", (new_role, username)
+        )
+        if cursor.rowcount == 0:
+            return False, "User not found."
+    return True, f"Role for {username} updated to {new_role}."
+
+
+def _set_authenticated_user(username, role):
+    st.session_state["logged_in"] = True
+    st.session_state["username"] = username
+    st.session_state["role"] = role or "Resource Owner"
 
 
 def show_login():
@@ -82,48 +121,7 @@ def show_login():
     if st.session_state.get("logged_in") is True:
         st.sidebar.success(f"Signed in as {st.session_state.get('username', 'User')}")
         if st.sidebar.button("Log out", key="auth_logout"):
-            st.session_state.pop("logged_in", None)
-            st.session_state.pop("username", None)
+            for key in ("logged_in", "username", "role"):
+                st.session_state.pop(key, None)
             st.rerun()
         return True
-
-    st.title("☁️ Cloud FinOps Optimizer")
-    st.subheader("Sign in or create an account")
-    login_tab, signup_tab = st.tabs(["Login", "Create Account"])
-
-    with login_tab:
-        with st.form("login_form"):
-            username = st.text_input("Username", key="login_username")
-            password = st.text_input("Password", type="password", key="login_password")
-            submitted = st.form_submit_button("Login", type="primary", use_container_width=True)
-        if submitted:
-            valid, saved_username = verify_user(username, password)
-            if valid:
-                st.session_state["logged_in"] = True
-                st.session_state["username"] = saved_username
-                st.rerun()
-            else:
-                st.error("Invalid username or password.")
-
-    with signup_tab:
-        st.caption("Choose a username and a password of at least 12 characters.")
-        with st.form("signup_form"):
-            new_username = st.text_input("Choose a username", key="signup_username")
-            new_password = st.text_input("Create password", type="password", key="signup_password")
-            confirm_password = st.text_input("Confirm password", type="password", key="signup_confirm")
-            signup_submitted = st.form_submit_button("Create Account", use_container_width=True)
-        if signup_submitted:
-            if new_password != confirm_password:
-                st.error("The passwords do not match.")
-            else:
-                success, message = register_user(new_username, new_password)
-                if success:
-                    # Sign the new user in immediately and let the main app continue
-                    # to the dashboard on the next Streamlit rerun.
-                    st.session_state["logged_in"] = True
-                    st.session_state["username"] = new_username.strip()
-                    st.rerun()
-                else:
-                    st.error(message)
-
-    return False
